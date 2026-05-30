@@ -1,5 +1,6 @@
 """
 data/market_data.py - Fetch OHLCV price data from Twelve Data & Alpha Vantage
+Rate limit: 8 requests/minute on free plan → use semaphore + delay
 """
 import asyncio
 from datetime import datetime
@@ -21,10 +22,33 @@ SYMBOL_MAP = {
     "XAUUSD": "XAU/USD",
     "XAGUSD": "XAG/USD",
     "BTCUSD": "BTC/USD",
+    "ETHUSD": "ETH/USD",
     "EURUSD": "EUR/USD",
     "GBPUSD": "GBP/USD",
     "USDJPY": "USD/JPY",
 }
+
+# ─────────────────────────────────────────
+# RATE LIMITER: max 6 request/menit (aman di bawah limit 8)
+# ─────────────────────────────────────────
+_rate_semaphore = asyncio.Semaphore(1)  # 1 request at a time
+_last_request_time = 0.0
+MIN_REQUEST_INTERVAL = 10.0  # 10 detik antar request = max 6/menit
+
+
+async def _rate_limited_get(client: httpx.AsyncClient, url: str, params: dict) -> httpx.Response:
+    """Wrapper dengan rate limiting otomatis"""
+    global _last_request_time
+    async with _rate_semaphore:
+        now = asyncio.get_event_loop().time()
+        elapsed = now - _last_request_time
+        if elapsed < MIN_REQUEST_INTERVAL:
+            wait = MIN_REQUEST_INTERVAL - elapsed
+            logger.debug(f"Rate limit: waiting {wait:.1f}s")
+            await asyncio.sleep(wait)
+        resp = await client.get(url, params=params)
+        _last_request_time = asyncio.get_event_loop().time()
+        return resp
 
 
 class TwelveDataClient:
@@ -33,12 +57,12 @@ class TwelveDataClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=15))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=15, max=60))
     async def get_ohlcv(
         self,
         symbol: str,
         timeframe: str,
-        outputsize: int = 200,
+        outputsize: int = 100,  # dikurangi dari 200 → hemat quota
     ) -> Optional[pd.DataFrame]:
         if not self.api_key:
             logger.warning("TwelveData API key not set")
@@ -47,8 +71,9 @@ class TwelveDataClient:
         td_symbol = SYMBOL_MAP.get(symbol, symbol)
         td_interval = TIMEFRAME_MAP_TD.get(timeframe, "1h")
 
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.get(
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await _rate_limited_get(
+                client,
                 f"{self.BASE_URL}/time_series",
                 params={
                     "symbol": td_symbol,
@@ -68,6 +93,7 @@ class TwelveDataClient:
 
         values = data.get("values", [])
         if not values:
+            logger.warning(f"TwelveData no values for {symbol}/{timeframe} (market closed?)")
             return None
 
         df = pd.DataFrame(values)
@@ -76,22 +102,27 @@ class TwelveDataClient:
         for col in ["open", "high", "low", "close", "volume"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.rename(columns={"open": "Open", "high": "High", "low": "Low",
-                                  "close": "Close", "volume": "Volume"})
+        df = df.rename(columns={
+            "open": "Open", "high": "High", "low": "Low",
+            "close": "Close", "volume": "Volume"
+        })
         return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=15))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=15, max=60))
     async def get_price(self, symbol: str) -> Optional[float]:
         if not self.api_key:
             return None
         td_symbol = SYMBOL_MAP.get(symbol, symbol)
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
+            resp = await _rate_limited_get(
+                client,
                 f"{self.BASE_URL}/price",
                 params={"symbol": td_symbol, "apikey": self.api_key},
             )
             resp.raise_for_status()
             data = resp.json()
+        if data.get("status") == "error":
+            return None
         price = data.get("price")
         return float(price) if price else None
 
@@ -113,7 +144,7 @@ class AlphaVantageClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=15))
+    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=15, max=60))
     async def get_ohlcv(
         self,
         symbol: str,
@@ -179,11 +210,11 @@ class MarketDataService:
         self,
         symbol: str,
         timeframe: str,
-        outputsize: int = 200,
+        outputsize: int = 100,
     ) -> Optional[pd.DataFrame]:
         # Try Twelve Data first
         df = await self.td.get_ohlcv(symbol, timeframe, outputsize)
-        if df is not None and len(df) >= 50:
+        if df is not None and len(df) >= 20:
             return df
 
         # Fallback to Alpha Vantage
@@ -201,18 +232,20 @@ class MarketDataService:
         timeframes: List[str] = None,
     ) -> dict:
         if timeframes is None:
-            timeframes = ["D1", "H4", "H1", "M15", "M5", "M1"]
+            # Kurangi timeframe dari 6 → 4 untuk hemat quota
+            # M1 dan M5 dihapus karena jarang dipakai signal engine
+            timeframes = ["D1", "H4", "H1", "M15"]
 
-        tasks = {tf: self.get_ohlcv(symbol, tf) for tf in timeframes}
-        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-
+        # Request SEQUENTIAL (satu per satu) bukan parallel
+        # untuk menghindari rate limit 8/menit
         mtf_data = {}
-        for tf, result in zip(tasks.keys(), results):
-            if isinstance(result, Exception):
-                logger.error(f"MTF fetch error {symbol}/{tf}: {result}")
-                mtf_data[tf] = None
-            else:
+        for tf in timeframes:
+            try:
+                result = await self.get_ohlcv(symbol, tf)
                 mtf_data[tf] = result
+            except Exception as e:
+                logger.error(f"MTF fetch error {symbol}/{tf}: {e}")
+                mtf_data[tf] = None
 
         return mtf_data
 
