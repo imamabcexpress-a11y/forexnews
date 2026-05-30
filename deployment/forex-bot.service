@@ -1,0 +1,27 @@
+[Unit]
+Description=Forex News & Signal Telegram Bot
+After=network.target postgresql.service redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/forex_bot
+EnvironmentFile=/opt/forex_bot/.env
+ExecStart=/opt/forex_bot/venv/bin/python main.py
+Restart=always
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=forex_bot
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
