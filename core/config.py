@@ -2,12 +2,19 @@
 core/config.py - Central configuration management
 """
 import os
-from pathlib import Path
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from typing import List
 
 load_dotenv()
+
+def _get_database_url() -> str:
+    url = os.getenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost:5432/forex_bot")
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return url
 
 class Settings(BaseModel):
     # Telegram
@@ -17,7 +24,7 @@ class Settings(BaseModel):
     TELEGRAM_ADMIN_ID: int = int(os.getenv("TELEGRAM_ADMIN_ID", "0"))
 
     # Database
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost/forex_bot")
+    DATABASE_URL: str = _get_database_url()
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
     # APIs
@@ -25,6 +32,7 @@ class Settings(BaseModel):
     ALPHA_VANTAGE_API_KEY: str = os.getenv("ALPHA_VANTAGE_API_KEY", "")
     POLYGON_API_KEY: str = os.getenv("POLYGON_API_KEY", "")
     TRADING_ECONOMICS_API_KEY: str = os.getenv("TRADING_ECONOMICS_API_KEY", "")
+    FINNHUB_API_KEY: str = os.getenv("FINNHUB_API_KEY", "")  # ← TAMBAHAN
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 
     # Bot
@@ -34,7 +42,7 @@ class Settings(BaseModel):
     SIGNAL_CHECK_INTERVAL: int = int(os.getenv("SIGNAL_CHECK_INTERVAL", "300"))
     PRICE_UPDATE_INTERVAL: int = int(os.getenv("PRICE_UPDATE_INTERVAL", "60"))
     ENABLE_AI_ANALYSIS: bool = os.getenv("ENABLE_AI_ANALYSIS", "true").lower() == "true"
-    ENABLE_DASHBOARD: bool = os.getenv("ENABLE_DASHBOARD", "true").lower() == "true"
+    ENABLE_DASHBOARD: bool = os.getenv("ENABLE_DASHBOARD", "false").lower() == "true"
     ENABLE_BREAKOUT_ALERTS: bool = os.getenv("ENABLE_BREAKOUT_ALERTS", "true").lower() == "true"
 
     # Dashboard
