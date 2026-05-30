@@ -1,5 +1,6 @@
 """
 data/news_fetcher.py - Fetch economic calendar from multiple APIs (no HTML scraping)
+Fallback order: TradingEconomics → TwelveData → Finnhub
 """
 import asyncio
 import hashlib
@@ -40,8 +41,8 @@ class TradingEconomicsClient:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     async def fetch_calendar(self, days_ahead: int = 7) -> List[dict]:
-        if not self.api_key:
-            logger.warning("TradingEconomics API key not set")
+        if not self.api_key or self.api_key == "your_trading_economics_key":
+            logger.warning("TradingEconomics API key not set, skipping")
             return []
 
         start = datetime.utcnow().strftime("%Y-%m-%d")
@@ -98,7 +99,7 @@ class TwelveDataCalendarClient:
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     async def fetch_calendar(self, days_ahead: int = 7) -> List[dict]:
         if not self.api_key:
-            logger.warning("TwelveData API key not set")
+            logger.warning("TwelveData API key not set, skipping")
             return []
 
         start = datetime.utcnow().strftime("%Y-%m-%d")
@@ -117,6 +118,10 @@ class TwelveDataCalendarClient:
             )
             resp.raise_for_status()
             data = resp.json()
+
+        if data.get("status") == "error":
+            logger.warning(f"TwelveData calendar error: {data.get('message')}")
+            return []
 
         events = []
         for item in data.get("result", {}).get("list", []):
@@ -142,6 +147,76 @@ class TwelveDataCalendarClient:
             except Exception as e:
                 logger.debug(f"Skipped TD event: {e}")
         return events
+
+
+# ─────────────────────────────────────────
+# Finnhub Economic Calendar (Fallback)
+# ─────────────────────────────────────────
+class FinnhubCalendarClient:
+    BASE_URL = "https://finnhub.io/api/v1/calendar/economic"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    async def fetch_calendar(self, days_ahead: int = 7) -> List[dict]:
+        if not self.api_key:
+            logger.warning("Finnhub API key not set, skipping")
+            return []
+
+        start = datetime.utcnow().strftime("%Y-%m-%d")
+        end = (datetime.utcnow() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                self.BASE_URL,
+                params={
+                    "token": self.api_key,
+                    "from": start,
+                    "to": end,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        events = []
+        for item in data.get("economicCalendar", []):
+            try:
+                dt_str = item.get("time", "")
+                if not dt_str:
+                    continue
+                release_utc = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                if release_utc.tzinfo is None:
+                    release_utc = UTC.localize(release_utc)
+
+                impact = self._map_impact(item.get("impact", ""))
+                event = {
+                    "event_id": _make_event_id(item.get("event", ""), release_utc),
+                    "title": item.get("event", "Unknown"),
+                    "country": item.get("country", ""),
+                    "currency": item.get("unit", ""),
+                    "impact": impact,
+                    "forecast": str(item.get("estimate", "") or ""),
+                    "previous": str(item.get("prev", "") or ""),
+                    "actual": str(item.get("actual", "") or ""),
+                    "release_time_utc": release_utc,
+                    "release_time_wib": _to_wib(release_utc),
+                    "source": "finnhub",
+                }
+                events.append(event)
+            except Exception as e:
+                logger.debug(f"Skipped Finnhub event: {e}")
+
+        logger.info(f"Finnhub fetched {len(events)} events")
+        return events
+
+    def _map_impact(self, impact_str: str) -> str:
+        impact_str = impact_str.lower()
+        if impact_str in ("high", "3"):
+            return "HIGH"
+        elif impact_str in ("medium", "2"):
+            return "MEDIUM"
+        return "LOW"
 
 
 # ─────────────────────────────────────────
@@ -172,27 +247,34 @@ class NewsAggregator:
     def __init__(self):
         self.te_client = TradingEconomicsClient(settings.TRADING_ECONOMICS_API_KEY)
         self.td_client = TwelveDataCalendarClient(settings.TWELVE_DATA_API_KEY)
+        self.fh_client = FinnhubCalendarClient(settings.FINNHUB_API_KEY)
 
     async def fetch_all(self, days_ahead: int = 7) -> List[dict]:
         results = await asyncio.gather(
             self.te_client.fetch_calendar(days_ahead),
             self.td_client.fetch_calendar(days_ahead),
+            self.fh_client.fetch_calendar(days_ahead),
             return_exceptions=True,
         )
 
         seen_ids = set()
         merged = []
-        for batch in results:
+        sources_ok = []
+
+        for i, batch in enumerate(results):
+            source = ["TradingEconomics", "TwelveData", "Finnhub"][i]
             if isinstance(batch, Exception):
-                logger.error(f"News fetch error: {batch}")
+                logger.error(f"News fetch error [{source}]: {batch}")
                 continue
+            if batch:
+                sources_ok.append(source)
             for event in batch:
                 eid = event["event_id"]
                 if eid not in seen_ids:
                     seen_ids.add(eid)
                     merged.append(event)
 
-        logger.info(f"Fetched {len(merged)} total news events")
+        logger.info(f"Fetched {len(merged)} total news events from: {', '.join(sources_ok) or 'none'}")
         return merged
 
     async def fetch_high_impact_only(self, days_ahead: int = 3) -> List[dict]:
