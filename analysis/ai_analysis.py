@@ -1,5 +1,5 @@
 """
-analysis/ai_analysis.py - AI-powered market summary using OpenAI
+analysis/ai_analysis.py - AI-powered market summary using Bluesminds API
 """
 import asyncio
 from datetime import datetime
@@ -7,17 +7,17 @@ from typing import Optional
 import httpx
 import pytz
 from loguru import logger
-
 from core.config import settings
 
 WIB = pytz.timezone("Asia/Jakarta")
 
-
 class AIAnalysisService:
-    """Generates natural language market summaries using OpenAI API"""
+    """Generates natural language market summaries using Bluesminds API"""
 
     def __init__(self):
         self.api_key = settings.OPENAI_API_KEY
+        self.base_url = "https://api.bluesminds.com/v1/chat/completions"
+        self.model = "claude-sonnet-4-6"
         self.enabled = settings.ENABLE_AI_ANALYSIS and bool(self.api_key)
         if not self.enabled:
             logger.warning("AI Analysis disabled (no OPENAI_API_KEY or feature disabled)")
@@ -70,10 +70,13 @@ Format with emoji. Keep it concise. End with disclaimer singkat."""
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    self.base_url,
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
                     json={
-                        "model": "gpt-4o-mini",
+                        "model": self.model,
                         "messages": [{"role": "user", "content": prompt}],
                         "max_tokens": 600,
                         "temperature": 0.3,
