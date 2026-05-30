@@ -10,7 +10,7 @@ alembic==1.13.2
 # Data & Analysis
 pandas==2.2.2
 numpy==1.26.4
-pandas-ta==0.3.14b0
+pandas-ta==0.4.71b0
 scipy==1.13.1
 
 # API Clients
